@@ -1,8 +1,21 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
+    #[cfg(windows)]
+    let first_arg = {
+        let argument = args.next();
+        if argument.as_deref().is_some_and(|value| value != "--tray") {
+            attach_cli_console();
+        }
+        argument
+    };
+    #[cfg(not(windows))]
+    let first_arg = args.next();
+
+    match first_arg.as_deref() {
         Some("--measure-idle") => measure_idle(),
         Some("--print") => print_snapshots(),
         Some("--tray") | None => tray::run(),
@@ -16,6 +29,38 @@ fn main() {
             eprintln!("Unknown argument: {command}");
             print_help();
             std::process::exit(2);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn attach_cli_console() {
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+        fn AllocConsole() -> i32;
+        fn GetStdHandle(std_handle: i32) -> *mut std::ffi::c_void;
+        fn SetStdHandle(std_handle: i32, handle: *mut std::ffi::c_void) -> i32;
+    }
+
+    // GUI-subsystem builds have no console by default. CLI invocations attach
+    // to their launching terminal, or create a console when started elsewhere.
+    let attached = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+    if attached == 0 {
+        unsafe {
+            AllocConsole();
+        }
+    }
+    // GUI-subsystem executables can start with null standard handles. Refresh
+    // Rust's process handles after attaching/allocating the CLI console.
+    for standard_handle in [-10, -11, -12] {
+        let handle = unsafe { GetStdHandle(standard_handle) };
+        if !handle.is_null() {
+            unsafe {
+                SetStdHandle(standard_handle, handle);
+            }
         }
     }
 }
