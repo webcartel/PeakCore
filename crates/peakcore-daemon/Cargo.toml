@@ -1,0 +1,19 @@
+[package]
+name = "peakcore-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "peakcore"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+peakcore-core = { path = "../peakcore-core" }
+peakcore-sys = { path = "../peakcore-sys" }
+serde.workspace = true
+serde_json.workspace = true

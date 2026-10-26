@@ -1,0 +1,27 @@
+[package]
+name = "peakcore-ui"
+version = "0.1.0"
+description = "PeakCore system monitor dashboard"
+authors = ["PeakCore"]
+edition = "2021"
+
+[lib]
+name = "peakcore_ui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
+peakcore-core = { path = "../../crates/peakcore-core" }
+peakcore-sys = { path = "../../crates/peakcore-sys" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[workspace]
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+default = ["custom-protocol"]

@@ -1,0 +1,10 @@
+/target/
+/ui/node_modules/
+/ui/.npm-cache/
+/ui/.pnpm-cache/
+/ui/.pnpm-home/
+/ui/.pnpm-store/
+/ui/dist/
+/ui/src-tauri/target/
+*.user
+*.suo
