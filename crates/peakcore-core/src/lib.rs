@@ -124,7 +124,7 @@ impl<T> RingBuffer<T> {
     }
 }
 
-pub const DETAIL_HISTORY_CAPACITY: usize = 1_800;
+pub const DETAIL_HISTORY_CAPACITY: usize = 3_600;
 pub const MINUTE_HISTORY_CAPACITY: usize = 1_440;
 pub const MAX_IPC_FRAME_SIZE: usize = 1_048_576;
 

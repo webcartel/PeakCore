@@ -315,6 +315,7 @@ a { color: inherit; text-decoration: none; }
 .chart-grid { position: absolute; inset: 0; display: flex; flex-direction: column; justify-content: space-between; }
 .chart-grid i { width: 100%; height: 1px; border-top: 1px solid var(--border); }
 .chart-canvas svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.chart-placeholder { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 12px; }
 .chart-x-labels { display: flex; justify-content: space-between; margin: 10px 0 0 45px; color: var(--subtle); font: 10px "Consolas", monospace; }
 
 .process-heading { margin-top: 31px; }
