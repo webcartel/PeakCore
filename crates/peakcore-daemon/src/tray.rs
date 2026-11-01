@@ -1,6 +1,8 @@
 #[cfg(windows)]
 mod platform {
     use peakcore_core::MemInfo;
+    use peakcore_core::alerts::{AlertEvent, Alerts};
+    use peakcore_core::config::{Config, Language, TrayMode};
     use peakcore_core::{HistoryPoint, SysSnapshot};
     use peakcore_sys::CpuSampler;
     use std::ffi::c_void;
@@ -350,9 +352,86 @@ mod platform {
         Ram,
     }
 
+    struct MenuStrings {
+        stats: &'static str,
+        mode_cpu_ram: &'static str,
+        mode_cpu: &'static str,
+        mode_ram: &'static str,
+        interval_1: &'static str,
+        interval_2: &'static str,
+        interval_5: &'static str,
+        autostart_off: &'static str,
+        autostart_on: &'static str,
+        config: &'static str,
+        exit: &'static str,
+        metric_cpu: &'static str,
+        metric_ram: &'static str,
+        balloon: &'static str,
+        open_failed: &'static str,
+        appdata_missing: &'static str,
+        config_failed: &'static str,
+        autostart_key_failed: &'static str,
+        autostart_update_failed: &'static str,
+        executable_missing: &'static str,
+    }
+
+    const MENU_RU: MenuStrings = MenuStrings {
+        stats: "Подробная статистика",
+        mode_cpu_ram: "Режим иконки: CPU + RAM",
+        mode_cpu: "Режим иконки: только CPU",
+        mode_ram: "Режим иконки: только RAM",
+        interval_1: "Обновление: 1 секунда",
+        interval_2: "Обновление: 2 секунды",
+        interval_5: "Обновление: 5 секунд",
+        autostart_off: "Отключить запуск с Windows",
+        autostart_on: "Запускать с Windows",
+        config: "Открыть конфиг",
+        exit: "Выход",
+        metric_cpu: "CPU",
+        metric_ram: "Память",
+        balloon: "{metric}: {value}% при пороге {threshold}%",
+        open_failed: "Не удалось открыть окно PeakCore:\n{error}",
+        appdata_missing: "Не найдена папка AppData.",
+        config_failed: "Не удалось открыть конфиг: {error}",
+        autostart_key_failed: "Не удалось открыть ветку Run текущего пользователя.",
+        autostart_update_failed: "Не удалось изменить автозапуск.",
+        executable_missing: "Не удалось определить путь к программе: {error}",
+    };
+
+    const MENU_EN: MenuStrings = MenuStrings {
+        stats: "Detailed statistics",
+        mode_cpu_ram: "Icon mode: CPU + RAM",
+        mode_cpu: "Icon mode: CPU only",
+        mode_ram: "Icon mode: RAM only",
+        interval_1: "Refresh: 1 second",
+        interval_2: "Refresh: 2 seconds",
+        interval_5: "Refresh: 5 seconds",
+        autostart_off: "Disable start with Windows",
+        autostart_on: "Start with Windows",
+        config: "Open config",
+        exit: "Exit",
+        metric_cpu: "CPU",
+        metric_ram: "Memory",
+        balloon: "{metric}: {value}% above the {threshold}% threshold",
+        open_failed: "Could not open the PeakCore window:\n{error}",
+        appdata_missing: "The AppData folder was not found.",
+        config_failed: "Could not open the config: {error}",
+        autostart_key_failed: "Could not open the current user's Run registry key.",
+        autostart_update_failed: "Could not change the startup setting.",
+        executable_missing: "Could not locate the executable: {error}",
+    };
+
+    fn menu_strings(language: Language) -> &'static MenuStrings {
+        match language {
+            Language::Ru => &MENU_RU,
+            Language::En => &MENU_EN,
+        }
+    }
+
     struct AppState {
         cpu: CpuSampler,
         cpu_pct: f32,
+        cpu_cores: Vec<f32>,
         mem: MemInfo,
         mode: Mode,
         interval_ms: u32,
@@ -362,6 +441,8 @@ mod platform {
         previous_visual: Option<(u32, u32, u8, u8, Mode)>,
         metrics: crate::state::SharedMetrics,
         last_full_mem: Option<Instant>,
+        config: Config,
+        config_revision: u64,
     }
 
     // The notification icon/window handles are owned by the single UI thread.
@@ -376,6 +457,71 @@ mod platform {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         f(&mut state)
+    }
+
+    fn try_with_state<T>(f: impl FnOnce(&mut AppState) -> T) -> Option<T> {
+        let state = STATE.get()?;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Some(f(&mut state))
+    }
+
+    fn mode_from(mode: TrayMode) -> Mode {
+        match mode {
+            TrayMode::CpuRam => Mode::CpuRam,
+            TrayMode::Cpu => Mode::Cpu,
+            TrayMode::Ram => Mode::Ram,
+        }
+    }
+
+    fn config_mode_from(mode: Mode) -> TrayMode {
+        match mode {
+            Mode::CpuRam => TrayMode::CpuRam,
+            Mode::Cpu => TrayMode::Cpu,
+            Mode::Ram => TrayMode::Ram,
+        }
+    }
+
+    /// Applies settings coming from the dashboard.
+    ///
+    /// Returns `Ok(false)` when the tray loop is not running, so a headless
+    /// daemon can still persist the file.
+    pub(crate) fn apply_config(config: &Config) -> Result<bool, String> {
+        let interval = config.sampling.tray_interval_ms;
+        let applied = try_with_state(|state| {
+            state.config = config.clone();
+            state.config_revision = state.config_revision.wrapping_add(1);
+            state
+                .metrics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .alerts
+                .replace_rules(config.alerts.clone());
+            state.mode = mode_from(config.tray.mode);
+            state.previous_visual = None;
+            if state.interval_ms != interval {
+                state.interval_ms = interval;
+                // SAFETY: replaces the timer bound to this window with the new period.
+                unsafe {
+                    KillTimer(state.hwnd, TIMER_ID);
+                    SetTimer(state.hwnd, TIMER_ID, interval, null_mut());
+                }
+            }
+            update_sample(state);
+        })
+        .is_some();
+        Ok(applied)
+    }
+
+    /// Writes the current settings to disk after a menu change.
+    fn persist_config() {
+        try_with_state(|state| state.config.clone()).and_then(|config| {
+            config
+                .save(&Config::path())
+                .err()
+                .map(|error| eprintln!("PeakCore could not save config: {error}"))
+        });
     }
 
     pub fn run() {
@@ -397,18 +543,36 @@ mod platform {
 
         let state_data = unsafe { zeroed() };
         let metrics = crate::state::new_shared_metrics();
+        let config_path = Config::path();
+        let config = Config::load_or_create(&config_path).unwrap_or_else(|error| {
+            eprintln!("PeakCore could not read {}: {error}", config_path.display());
+            Config::default()
+        });
+        {
+            let mut store = metrics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            store.alerts = Alerts::new(config.alerts.clone());
+            store.history = peakcore_core::History::with_windows(
+                u64::from(config.history.minutes_detail) * 60_000,
+                u64::from(config.history.hours_aggregate) * 3_600_000,
+            );
+        }
         let _ = STATE.set(Mutex::new(AppState {
             cpu: CpuSampler::default(),
             cpu_pct: 0.0,
+            cpu_cores: Vec::new(),
             mem: MemInfo::default(),
-            mode: Mode::CpuRam,
-            interval_ms: 2_000,
+            mode: mode_from(config.tray.mode),
+            interval_ms: config.sampling.tray_interval_ms,
             icon: null_mut(),
             data: state_data,
             hwnd: null_mut(),
             previous_visual: None,
             metrics: metrics.clone(),
             last_full_mem: None,
+            config,
+            config_revision: 0,
         }));
 
         let class_name = wide::<16>("PeakCoreTray");
@@ -458,13 +622,26 @@ mod platform {
         }
         with_state(|state| {
             state.hwnd = hwnd;
+            // The shell reads `cbSize` to choose the NOTIFYICONDATA layout; with a
+            // zero size it treats the struct as the legacy v1 layout and NIF_INFO
+            // balloons are never delivered.
+            state.data.size = size_of::<NotifyIconDataW>() as u32;
+            state.data.id = IDI_APP as u32;
             state.data.hwnd = hwnd;
             state.data.tip = data.tip;
             state.data.flags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
             state.data.callback_message = WM_USER + 1;
         });
         crate::ipc::start_server(metrics, hwnd as usize);
-        let icon = with_state(|state| render_icon(state.cpu_pct, 0.0, state.mode));
+        let icon = with_state(|state| {
+            render_icon(
+                state.cpu_pct,
+                0.0,
+                state.mode,
+                state.config.tray.warn_pct,
+                state.config.tray.crit_pct,
+            )
+        });
         with_state(|state| {
             state.icon = icon;
             state.data.icon = icon;
@@ -555,8 +732,13 @@ mod platform {
     }
 
     fn update_sample(state: &mut AppState) {
-        if let Ok(Some(cpu)) = state.cpu.sample() {
-            state.cpu_pct = cpu;
+        if let Ok(cpu) = state.cpu.sample_usage() {
+            if let Some(total) = cpu.total {
+                state.cpu_pct = total;
+            }
+            if !cpu.cores.is_empty() {
+                state.cpu_cores = cpu.cores;
+            }
         }
         let now = Instant::now();
         let full_memory_due = state
@@ -588,7 +770,7 @@ mod platform {
             .unwrap_or_default()
             .as_millis() as u64;
         let mem_pct = percentage(state.mem.used, state.mem.total);
-        {
+        let fired = {
             let mut metrics = state
                 .metrics
                 .lock()
@@ -596,19 +778,35 @@ mod platform {
             metrics.snapshot = SysSnapshot {
                 ts_ms,
                 cpu_total: state.cpu_pct,
-                cpu_cores: Vec::new(),
+                cpu_cores: state.cpu_cores.clone(),
                 mem: state.mem.clone(),
+                config_revision: state.config_revision,
             };
             metrics.history.push(HistoryPoint {
                 ts_ms,
                 cpu: state.cpu_pct,
                 mem_pct,
             });
+            metrics.alerts.evaluate(ts_ms, state.cpu_pct, mem_pct)
+        };
+        for event in fired {
+            show_alert_balloon(
+                &mut state.data,
+                &event,
+                menu_strings(state.config.ui.language),
+            );
         }
         let ram_pct = percentage(state.mem.used, state.mem.total);
+        let (warn_pct, crit_pct) = (state.config.tray.warn_pct, state.config.tray.crit_pct);
         let cpu = state.cpu_pct.round().clamp(0.0, 99.0) as u32;
         let ram = ram_pct.round().clamp(0.0, 99.0) as u32;
-        let visual = (cpu, ram, level(state.cpu_pct), level(ram_pct), state.mode);
+        let visual = (
+            cpu,
+            ram,
+            level(state.cpu_pct, warn_pct, crit_pct),
+            level(ram_pct, warn_pct, crit_pct),
+            state.mode,
+        );
         let old_tooltip = state.data.tip;
         set_tooltip(
             &mut state.data,
@@ -628,7 +826,7 @@ mod platform {
             return;
         }
         state.previous_visual = Some(visual);
-        let icon = render_icon(state.cpu_pct, ram_pct, state.mode);
+        let icon = render_icon(state.cpu_pct, ram_pct, state.mode, warn_pct, crit_pct);
         if icon.is_null() {
             return;
         }
@@ -652,14 +850,43 @@ mod platform {
         }
     }
 
-    fn level(value: f32) -> u8 {
-        if value < 60.0 {
+    fn level(value: f32, warn_pct: u8, crit_pct: u8) -> u8 {
+        if value < f32::from(warn_pct) {
             0
-        } else if value <= 85.0 {
+        } else if value <= f32::from(crit_pct) {
             1
         } else {
             2
         }
+    }
+
+    fn show_alert_balloon(data: &mut NotifyIconDataW, event: &AlertEvent, strings: &MenuStrings) {
+        const NIF_INFO: u32 = 0x0010;
+        const NIIF_WARNING: u32 = 0x0002;
+        let metric = match event.metric {
+            peakcore_core::config::AlertMetric::Cpu => strings.metric_cpu,
+            peakcore_core::config::AlertMetric::Ram => strings.metric_ram,
+        };
+        let text = strings
+            .balloon
+            .replace("{metric}", metric)
+            .replace("{value}", &format!("{:.0}", event.value_pct))
+            .replace("{threshold}", &event.threshold_pct.to_string());
+        data.info = [0; 256];
+        for (slot, unit) in data.info.iter_mut().zip(text.encode_utf16()) {
+            *slot = unit;
+        }
+        data.info_title = [0; 64];
+        for (slot, unit) in data.info_title.iter_mut().zip("PeakCore".encode_utf16()) {
+            *slot = unit;
+        }
+        data.info_flags = NIIF_WARNING;
+        data.flags = NIF_INFO;
+        // SAFETY: the notification data carries a valid icon and NUL-terminated texts.
+        unsafe {
+            Shell_NotifyIconW(NIM_MODIFY, data);
+        }
+        data.flags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     }
 
     fn set_tooltip(data: &mut NotifyIconDataW, cpu: f32, used: u64, total: u64) {
@@ -678,9 +905,9 @@ mod platform {
         }
     }
 
-    fn render_icon(cpu_pct: f32, ram_pct: f32, mode: Mode) -> Hicon {
+    fn render_icon(cpu_pct: f32, ram_pct: f32, mode: Mode, warn_pct: u8, crit_pct: u8) -> Hicon {
         const SIZE: i32 = 16;
-        let pixels = render_pixels(cpu_pct, ram_pct, mode);
+        let pixels = render_pixels(cpu_pct, ram_pct, mode, warn_pct, crit_pct);
 
         let info = BitmapInfo {
             header: BitmapInfoHeader {
@@ -738,7 +965,13 @@ mod platform {
         icon
     }
 
-    fn render_pixels(cpu_pct: f32, ram_pct: f32, mode: Mode) -> Vec<u8> {
+    fn render_pixels(
+        cpu_pct: f32,
+        ram_pct: f32,
+        mode: Mode,
+        warn_pct: u8,
+        crit_pct: u8,
+    ) -> Vec<u8> {
         const SIZE: i32 = 16;
         let mut pixels = vec![0u8; (SIZE * SIZE * 4) as usize];
         for y in 0..SIZE {
@@ -750,10 +983,10 @@ mod platform {
         let cpu = cpu_pct.round().clamp(0.0, 99.0) as u32;
         let ram = ram_pct.round().clamp(0.0, 99.0) as u32;
         if mode != Mode::Ram {
-            draw_number(&mut pixels, cpu, 1, color(cpu_pct));
+            draw_number(&mut pixels, cpu, 1, color(cpu_pct, warn_pct, crit_pct));
         }
         if mode != Mode::Cpu {
-            draw_number(&mut pixels, ram, 9, color(ram_pct));
+            draw_number(&mut pixels, ram, 9, color(ram_pct, warn_pct, crit_pct));
         }
         pixels
     }
@@ -787,8 +1020,8 @@ mod platform {
         }
     }
 
-    fn color(value: f32) -> [u8; 3] {
-        match level(value) {
+    fn color(value: f32, warn_pct: u8, crit_pct: u8) -> [u8; 3] {
+        match level(value, warn_pct, crit_pct) {
             0 => [89, 211, 145],
             1 => [255, 201, 87],
             _ => [255, 102, 112],
@@ -800,61 +1033,42 @@ mod platform {
         if menu.is_null() {
             return;
         }
-        let (mode, interval) = with_state(|state| (state.mode, state.interval_ms));
-        append(menu, ID_STATS, "Подробная статистика");
+        let (mode, interval, strings) = with_state(|state| {
+            (
+                state.mode,
+                state.interval_ms,
+                menu_strings(state.config.ui.language),
+            )
+        });
+        append(menu, ID_STATS, strings.stats);
         unsafe {
             AppendMenuW(menu, MF_SEPARATOR, 0, null());
         }
         append_checked(
             menu,
             ID_MODE_CPU_RAM,
-            "Режим иконки: CPU + RAM",
+            strings.mode_cpu_ram,
             mode == Mode::CpuRam,
         );
-        append_checked(
-            menu,
-            ID_MODE_CPU,
-            "Режим иконки: только CPU",
-            mode == Mode::Cpu,
-        );
-        append_checked(
-            menu,
-            ID_MODE_RAM,
-            "Режим иконки: только RAM",
-            mode == Mode::Ram,
-        );
-        append_checked(
-            menu,
-            ID_INTERVAL_1,
-            "Обновление: 1 секунда",
-            interval == 1_000,
-        );
-        append_checked(
-            menu,
-            ID_INTERVAL_2,
-            "Обновление: 2 секунды",
-            interval == 2_000,
-        );
-        append_checked(
-            menu,
-            ID_INTERVAL_5,
-            "Обновление: 5 секунд",
-            interval == 5_000,
-        );
+        append_checked(menu, ID_MODE_CPU, strings.mode_cpu, mode == Mode::Cpu);
+        append_checked(menu, ID_MODE_RAM, strings.mode_ram, mode == Mode::Ram);
+        append_checked(menu, ID_INTERVAL_1, strings.interval_1, interval == 1_000);
+        append_checked(menu, ID_INTERVAL_2, strings.interval_2, interval == 2_000);
+        append_checked(menu, ID_INTERVAL_5, strings.interval_5, interval == 5_000);
         append(
             menu,
             ID_AUTOSTART,
             if autostart_enabled() {
-                "Отключить запуск с Windows"
+                strings.autostart_off
             } else {
-                "Запускать с Windows"
+                strings.autostart_on
             },
         );
-        append(menu, ID_CONFIG, "Открыть конфиг");
+        append(menu, ID_CONFIG, strings.config);
         unsafe {
             AppendMenuW(menu, MF_SEPARATOR, 0, null());
         }
-        append(menu, ID_EXIT, "Выход");
+        append(menu, ID_EXIT, strings.exit);
         let mut point = Point { x: 0, y: 0 };
         unsafe {
             GetCursorPos(&mut point);
@@ -921,21 +1135,27 @@ mod platform {
     fn set_mode(hwnd: Hwnd, mode: Mode) {
         with_state(|state| {
             state.mode = mode;
+            state.config.tray.mode = config_mode_from(mode);
+            state.config_revision = state.config_revision.wrapping_add(1);
             state.previous_visual = None;
             update_sample(state);
         });
+        persist_config();
         let _ = hwnd;
     }
 
     fn set_interval(hwnd: Hwnd, interval: u32) {
         with_state(|state| {
             state.interval_ms = interval;
+            state.config.sampling.tray_interval_ms = interval;
+            state.config_revision = state.config_revision.wrapping_add(1);
             // SAFETY: replaces the timer with the requested sampling period.
             unsafe {
                 KillTimer(hwnd, TIMER_ID);
                 SetTimer(hwnd, TIMER_ID, interval, null_mut());
             }
         });
+        persist_config();
     }
 
     fn show_message(hwnd: Hwnd, text: &str, title: &str) {
@@ -948,9 +1168,10 @@ mod platform {
 
     fn open_dashboard(hwnd: Hwnd) {
         if let Err(error) = launch_dashboard() {
+            let strings = with_state(|state| menu_strings(state.config.ui.language));
             show_message(
                 hwnd,
-                &format!("Не удалось открыть окно PeakCore:\n{error}"),
+                &strings.open_failed.replace("{error}", &error.to_string()),
                 "PeakCore",
             );
         }
@@ -1005,7 +1226,12 @@ mod platform {
 
         let dashboard = candidates
             .iter()
-            .find(|path| path.is_file())
+            .filter(|path| path.is_file())
+            .max_by_key(|path| {
+                std::fs::metadata(path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+            })
             .ok_or_else(|| {
                 let searched = candidates
                     .iter()
@@ -1056,8 +1282,9 @@ mod platform {
     }
 
     fn open_config(hwnd: Hwnd) {
+        let strings = with_state(|state| menu_strings(state.config.ui.language));
         let Some(app_data) = std::env::var_os("APPDATA") else {
-            show_message(hwnd, "Не найдена папка AppData.", "PeakCore");
+            show_message(hwnd, strings.appdata_missing, "PeakCore");
             return;
         };
         let directory = std::path::PathBuf::from(app_data).join("PeakCore");
@@ -1085,7 +1312,7 @@ crit_pct = 85
         if let Err(error) = result {
             show_message(
                 hwnd,
-                &format!("Не удалось открыть конфиг: {error}"),
+                &strings.config_failed.replace("{error}", &error.to_string()),
                 "PeakCore",
             );
         }
@@ -1125,6 +1352,7 @@ crit_pct = 85
     }
 
     fn toggle_autostart(hwnd: Hwnd) {
+        let strings = with_state(|state| menu_strings(state.config.ui.language));
         let subkey = wide::<64>("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
         let mut key = null_mut();
         if unsafe {
@@ -1137,11 +1365,7 @@ crit_pct = 85
             )
         } != ERROR_SUCCESS
         {
-            show_message(
-                hwnd,
-                "Could not open the current user's Run registry key.",
-                "PeakCore",
-            );
+            show_message(hwnd, strings.autostart_key_failed, "PeakCore");
             return;
         }
         let name = wide::<16>("PeakCore");
@@ -1153,7 +1377,9 @@ crit_pct = 85
                 Err(error) => {
                     show_message(
                         hwnd,
-                        &format!("Could not locate executable: {error}"),
+                        &strings
+                            .executable_missing
+                            .replace("{error}", &error.to_string()),
                         "PeakCore",
                     );
                     unsafe {
@@ -1178,7 +1404,7 @@ crit_pct = 85
             RegCloseKey(key);
         }
         if result != ERROR_SUCCESS {
-            show_message(hwnd, "Could not update the startup setting.", "PeakCore");
+            show_message(hwnd, strings.autostart_update_failed, "PeakCore");
         }
     }
 
@@ -1188,7 +1414,7 @@ crit_pct = 85
 
         #[test]
         fn cpu_ram_icon_pixels_match_snapshot() {
-            let pixels = render_pixels(12.0, 34.0, Mode::CpuRam);
+            let pixels = render_pixels(12.0, 34.0, Mode::CpuRam, 60, 85);
             let hash = pixels
                 .iter()
                 .fold(14_695_981_039_346_656_037u64, |hash, byte| {
@@ -1196,12 +1422,31 @@ crit_pct = 85
                 });
             assert_eq!(hash, 4_621_873_223_345_363_145);
         }
+
+        #[test]
+        fn configured_thresholds_drive_icon_colors() {
+            assert_eq!(level(59.0, 60, 85), 0);
+            assert_eq!(level(70.0, 60, 85), 1);
+            assert_eq!(level(90.0, 60, 85), 2);
+            assert_eq!(level(70.0, 40, 65), 2, "custom thresholds apply too");
+        }
     }
 }
 
 #[cfg(windows)]
 pub fn run() {
     platform::run();
+}
+
+/// Applies dashboard settings to the running tray loop.
+#[cfg(windows)]
+pub(crate) fn apply_config(config: &peakcore_core::config::Config) -> Result<bool, String> {
+    platform::apply_config(config)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn apply_config(_config: &peakcore_core::config::Config) -> Result<bool, String> {
+    Ok(false)
 }
 
 #[cfg(not(windows))]

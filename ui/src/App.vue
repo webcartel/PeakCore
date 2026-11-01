@@ -1,15 +1,18 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from 'vue'
+import { onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import {
   Activity, Bell, ChevronDown, Cpu, HardDrive, LayoutDashboard,
-  MemoryStick, Maximize2, Minus, Minimize2, Network, Settings2, X,
+  MemoryStick, Maximize2, Minus, Minimize2, Network, Settings2, X, Gpu,
 } from '@lucide/vue'
 import { useMetricsStore, type DashboardUpdate } from './stores/metrics'
+import { useConfigStore } from './stores/config'
+import { setLocale, t, type MessageKey } from './i18n'
 
 const route = useRoute()
 const metrics = useMetricsStore()
-const theme = ref<'dark' | 'light'>('dark')
+const config = useConfigStore()
+const resolvedTheme = ref<'dark' | 'light'>('dark')
 const maximized = ref(false)
 let unlistenUpdates: (() => void) | undefined
 let unlistenResize: (() => void) | undefined
@@ -17,20 +20,65 @@ let samplingPoll: number | undefined
 let syncSamplingHandler: (() => void) | undefined
 let sampling = false
 let checkingVisibility = false
-const navItems = [
-  { label: 'Обзор', path: '/', icon: LayoutDashboard },
-  { label: 'Процессы', path: '/processes', icon: Activity },
-  { label: 'CPU', path: '/cpu', icon: Cpu },
-  { label: 'Память', path: '/memory', icon: MemoryStick },
-  { label: 'Диск', path: '/disk', icon: HardDrive },
-  { label: 'Сеть', path: '/network', icon: Network },
-  { label: 'Алерты', path: '/alerts', icon: Bell },
+let systemTheme: MediaQueryList | undefined
+const navItems: { key: MessageKey; path: string; icon: typeof LayoutDashboard }[] = [
+  { key: 'nav.overview', path: '/', icon: LayoutDashboard },
+  { key: 'nav.processes', path: '/processes', icon: Activity },
+  { key: 'nav.cpu', path: '/cpu', icon: Cpu },
+  { key: 'nav.memory', path: '/memory', icon: MemoryStick },
+  { key: 'nav.disk', path: '/disk', icon: HardDrive },
+  { key: 'nav.network', path: '/network', icon: Network },
+  { key: 'nav.gpu', path: '/gpu', icon: Gpu },
+  { key: 'nav.alerts', path: '/alerts', icon: Bell },
 ]
 
-function toggleTheme() {
-  theme.value = theme.value === 'dark' ? 'light' : 'dark'
-  document.documentElement.dataset.theme = theme.value
+const sectionTitle = () => {
+  const key = route.meta.titleKey as MessageKey | undefined
+  return key ? t(key) : 'PeakCore'
 }
+
+function resolveTheme(): 'dark' | 'light' {
+  const preference = config.config?.ui.theme ?? 'system'
+  if (preference === 'system') return systemTheme?.matches ? 'light' : 'dark'
+  return preference
+}
+
+function applyTheme() {
+  resolvedTheme.value = resolveTheme()
+  document.documentElement.dataset.theme = resolvedTheme.value
+}
+
+async function toggleTheme() {
+  const next = resolvedTheme.value === 'dark' ? 'light' : 'dark'
+  resolvedTheme.value = next
+  document.documentElement.dataset.theme = next
+  if (config.config) {
+    await config.save({ ...config.config, ui: { ...config.config.ui, theme: next } })
+  }
+}
+
+watch(() => config.config?.ui.theme, applyTheme)
+watch(
+  () => config.config?.ui.language,
+  (language) => setLocale(language ?? 'ru'),
+)
+
+let appliedConfigRevision: number | null = null
+watch(
+  () => metrics.snapshot?.config_revision,
+  async (revision) => {
+    if (revision === undefined) return
+    if (appliedConfigRevision === null || revision === appliedConfigRevision) {
+      appliedConfigRevision = revision
+      return
+    }
+    // The tray menu or another client changed the settings: refresh locally.
+    appliedConfigRevision = revision
+    await config.load()
+    applyTheme()
+    setLocale(config.config?.ui.language ?? 'ru')
+  },
+)
 
 async function windowAction(action: 'minimize' | 'close') {
   if (!('__TAURI_INTERNALS__' in window)) return
@@ -68,6 +116,10 @@ async function stopSampling() {
 }
 
 onMounted(async () => {
+  systemTheme = window.matchMedia('(prefers-color-scheme: light)')
+  systemTheme.addEventListener('change', () => {
+    if ((config.config?.ui.theme ?? 'system') === 'system') applyTheme()
+  })
   if (!('__TAURI_INTERNALS__' in window)) return
   try {
     const { getCurrentWindow } = await import('@tauri-apps/api/window')
@@ -86,6 +138,14 @@ onMounted(async () => {
     unlistenUpdates = await listen<DashboardUpdate>('dashboard-update', (event) => {
       metrics.apply(event.payload)
     })
+    await config.load()
+    applyTheme()
+    setLocale(config.config?.ui.language ?? 'ru')
+    if (config.config) {
+      await invoke('set_sampling_interval', {
+        intervalMs: config.config.sampling.window_interval_ms,
+      })
+    }
     const syncSampling = async () => {
       if (checkingVisibility) return
       checkingVisibility = true
@@ -126,26 +186,26 @@ onUnmounted(() => {
       <div class="brand-mark"><Activity :size="15" /></div>
       <span class="brand-name">Peak<span>Core</span></span>
       <span class="title-divider"></span>
-      <span class="current-section">{{ route.meta.title ?? 'Система' }}</span>
+      <span class="current-section">{{ sectionTitle() }}</span>
       <div class="title-spacer" data-tauri-drag-region></div>
-      <button class="icon-button theme-button" title="Переключить тему" @click="toggleTheme">◐</button>
-      <button class="window-button" title="Свернуть" @click="windowAction('minimize')"><Minus :size="14" /></button>
-      <button class="window-button" :title="maximized ? 'Восстановить размер' : 'Развернуть на весь экран'" @click="toggleWindowSize"><component :is="maximized ? Minimize2 : Maximize2" :size="14" /></button>
-      <button class="window-button close-button" title="Закрыть" @click="windowAction('close')"><X :size="15" /></button>
+      <button class="icon-button theme-button" :title="t('app.toggleTheme')" @click="toggleTheme">◐</button>
+      <button class="window-button" :title="t('app.minimize')" @click="windowAction('minimize')"><Minus :size="14" /></button>
+      <button class="window-button" :title="maximized ? t('app.restore') : t('app.maximize')" @click="toggleWindowSize"><component :is="maximized ? Minimize2 : Maximize2" :size="14" /></button>
+      <button class="window-button close-button" :title="t('app.close')" @click="windowAction('close')"><X :size="15" /></button>
     </header>
     <div class="workspace">
       <aside class="sidebar">
-        <div class="nav-caption">МОНИТОРИНГ</div>
+        <div class="nav-caption">{{ t('app.monitoring') }}</div>
         <nav>
           <RouterLink v-for="item in navItems" :key="item.path" :to="item.path" class="nav-item">
             <component :is="item.icon" :size="17" :stroke-width="1.8" />
-            <span>{{ item.label }}</span>
+            <span>{{ t(item.key) }}</span>
             <span v-if="item.path === '/'" class="nav-active-dot"></span>
           </RouterLink>
         </nav>
         <div class="sidebar-bottom">
-          <RouterLink to="/settings" class="nav-item"><Settings2 :size="17" /><span>Настройки</span></RouterLink>
-          <div class="daemon-state"><span class="online-dot" :class="{ offline: !metrics.daemonConnected }"></span><span>{{ metrics.daemonConnected ? 'Демон активен' : 'Без связи с демоном' }}</span><ChevronDown :size="13" /></div>
+          <RouterLink to="/settings" class="nav-item"><Settings2 :size="17" /><span>{{ t('nav.settings') }}</span></RouterLink>
+          <div class="daemon-state"><span class="online-dot" :class="{ offline: !metrics.daemonConnected }"></span><span>{{ metrics.daemonConnected ? t('app.daemonOnline') : t('app.daemonOffline') }}</span><ChevronDown :size="13" /></div>
           <div class="version">PEAKCORE <span>0.1.0</span></div>
         </div>
       </aside>

@@ -1,18 +1,12 @@
 <script setup lang="ts">
-import { useRoute } from 'vue-router'
 import { Construction } from '@lucide/vue'
-
-const route = useRoute()
-const names: Record<string, string> = {
-  processes: 'Процессы', cpu: 'CPU', memory: 'Память', disk: 'Диск',
-  network: 'Сеть', alerts: 'Алерты', settings: 'Настройки',
-}
+import { t } from '../i18n'
 </script>
 
 <template>
   <section class="placeholder-page">
     <div class="placeholder-icon"><Construction :size="20" /></div>
-    <h1>{{ names[String(route.params.section)] ?? 'PeakCore' }}</h1>
-    <p>Этот раздел появится на следующем этапе разработки.</p>
+    <h1>{{ t('placeholder.title') }}</h1>
+    <p>{{ t('placeholder.text') }}</p>
   </section>
 </template>

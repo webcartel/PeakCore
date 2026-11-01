@@ -9,29 +9,70 @@ struct CpuTimes {
     user: u64,
 }
 
-/// Samples total CPU utilization from `GetSystemTimes`.
+/// Utilization measured between two sampling calls.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CpuUsage {
+    /// Total utilization; absent on the first sample or when counters did not advance.
+    pub total: Option<f32>,
+    /// Utilization per logical processor; empty on the first sample.
+    pub cores: Vec<f32>,
+}
+
+/// Utilization percentage between two counter snapshots for one processor.
+///
+/// `kernel` includes idle time, so busy ticks are `kernel + user - idle`.
+fn core_percent(previous: CpuTimes, current: CpuTimes) -> Option<f32> {
+    let total =
+        current.kernel.saturating_sub(previous.kernel) + current.user.saturating_sub(previous.user);
+    let idle = current.idle.saturating_sub(previous.idle);
+    (total > 0).then(|| {
+        (total.saturating_sub(idle) as f64 * 100.0 / total as f64).clamp(0.0, 100.0) as f32
+    })
+}
+
+/// Per-processor percentages aligned with `current`. A processor without a
+/// baseline, or whose counters did not advance, reports zero.
+fn cores_usage(previous: &[CpuTimes], current: &[CpuTimes]) -> Vec<f32> {
+    current
+        .iter()
+        .enumerate()
+        .map(|(index, current)| {
+            previous
+                .get(index)
+                .and_then(|previous| core_percent(*previous, *current))
+                .unwrap_or(0.0)
+        })
+        .collect()
+}
+
+/// Samples total CPU utilization from `GetSystemTimes` and per-processor
+/// utilization from `NtQuerySystemInformation`.
 #[derive(Debug, Default)]
 pub struct CpuSampler {
     previous: Option<CpuTimes>,
+    previous_cores: Option<Vec<CpuTimes>>,
 }
 
 impl CpuSampler {
     /// Returns `None` for the initial sample or when counters did not advance.
     pub fn sample(&mut self) -> io::Result<Option<f32>> {
+        Ok(self.sample_usage()?.total)
+    }
+
+    /// Samples total and per-processor utilization from the same counters.
+    pub fn sample_usage(&mut self) -> io::Result<CpuUsage> {
         let current = platform::system_times()?;
-        let Some(previous) = self.previous.replace(current) else {
-            return Ok(None);
+        let current_cores = platform::processor_times()?;
+        let total = self
+            .previous
+            .replace(current)
+            .and_then(|previous| core_percent(previous, current));
+        let cores = match self.previous_cores.take() {
+            Some(previous) => cores_usage(&previous, &current_cores),
+            None => Vec::new(),
         };
-        let total = current.kernel.saturating_sub(previous.kernel)
-            + current.user.saturating_sub(previous.user);
-        let idle = current.idle.saturating_sub(previous.idle);
-        if total == 0 {
-            return Ok(None);
-        }
-        let busy = total.saturating_sub(idle);
-        Ok(Some(
-            (busy as f64 * 100.0 / total as f64).clamp(0.0, 100.0) as f32
-        ))
+        self.previous_cores = Some(current_cores);
+        Ok(CpuUsage { total, cores })
     }
 }
 
@@ -54,6 +95,7 @@ pub use resources::ResourceSampler;
 #[cfg(windows)]
 mod platform {
     use super::*;
+    use std::ffi::c_void;
     use std::mem::size_of;
 
     #[repr(C)]
@@ -144,6 +186,32 @@ mod platform {
         fn GetLastError() -> u32;
     }
 
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtQuerySystemInformation(
+            info_class: u32,
+            info: *mut c_void,
+            info_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
+    }
+
+    /// `SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION` from `winternl.h`.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct ProcessorPerformanceInformation {
+        idle_time: i64,
+        kernel_time: i64,
+        user_time: i64,
+        dpc_time: i64,
+        interrupt_time: i64,
+        interrupt_count: u32,
+    }
+
+    const SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION: u32 = 8;
+    const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004u32 as i32;
+    const MAX_PROCESSOR_COUNT: usize = 4096;
+
     #[link(name = "psapi")]
     unsafe extern "system" {
         fn GetPerformanceInfo(info: *mut PerformanceInformation, size: u32) -> i32;
@@ -169,6 +237,52 @@ mod platform {
             kernel: kernel.value(),
             user: user.value(),
         })
+    }
+
+    pub(super) fn processor_times() -> io::Result<Vec<CpuTimes>> {
+        // `SystemProcessorPerformanceInformation` reports the caller's processor
+        // group only (up to 64 logical CPUs); machines with more need a per-group
+        // query, which is not implemented yet.
+        let entry_size = size_of::<ProcessorPerformanceInformation>();
+        let mut capacity = 64usize;
+        loop {
+            let mut buffer = vec![ProcessorPerformanceInformation::default(); capacity];
+            let mut returned = 0u32;
+            let length = (capacity * entry_size) as u32;
+            // SAFETY: the buffer is writable for `length` bytes and the output length is writable.
+            let status = unsafe {
+                NtQuerySystemInformation(
+                    SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION,
+                    buffer.as_mut_ptr().cast(),
+                    length,
+                    &mut returned,
+                )
+            };
+            if status == STATUS_INFO_LENGTH_MISMATCH {
+                capacity = ((returned as usize).div_ceil(entry_size)).max(capacity * 2);
+                if capacity > MAX_PROCESSOR_COUNT {
+                    return Err(io::Error::other(
+                        "NtQuerySystemInformation reported an implausible processor count",
+                    ));
+                }
+                continue;
+            }
+            if status != 0 {
+                return Err(io::Error::other(format!(
+                    "NtQuerySystemInformation failed: 0x{status:08X}"
+                )));
+            }
+            let count = (returned as usize / entry_size).min(capacity);
+            buffer.truncate(count);
+            return Ok(buffer
+                .into_iter()
+                .map(|info| CpuTimes {
+                    idle: info.idle_time.max(0) as u64,
+                    kernel: info.kernel_time.max(0) as u64,
+                    user: info.user_time.max(0) as u64,
+                })
+                .collect());
+        }
     }
 
     pub(super) fn mem_info() -> io::Result<peakcore_core::MemInfo> {
@@ -232,6 +346,13 @@ mod platform {
         ))
     }
 
+    pub(super) fn processor_times() -> io::Result<Vec<CpuTimes>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "PeakCore system sampling is Windows-only",
+        ))
+    }
+
     pub(super) fn mem_info() -> io::Result<peakcore_core::MemInfo> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -251,13 +372,6 @@ mod platform {
 mod tests {
     use super::*;
 
-    fn cpu_percent(previous: CpuTimes, current: CpuTimes) -> Option<f32> {
-        let total = current.kernel.saturating_sub(previous.kernel)
-            + current.user.saturating_sub(previous.user);
-        let idle = current.idle.saturating_sub(previous.idle);
-        (total > 0).then(|| (total.saturating_sub(idle) as f64 * 100.0 / total as f64) as f32)
-    }
-
     #[test]
     fn cpu_delta_excludes_idle_time() {
         let previous = CpuTimes {
@@ -270,7 +384,7 @@ mod tests {
             kernel: 300,
             user: 200,
         };
-        assert_eq!(cpu_percent(previous, current), Some(75.0));
+        assert_eq!(core_percent(previous, current), Some(75.0));
     }
 
     #[test]
@@ -280,6 +394,68 @@ mod tests {
             kernel: 200,
             user: 100,
         };
-        assert_eq!(cpu_percent(times, times), None);
+        assert_eq!(core_percent(times, times), None);
+    }
+
+    #[test]
+    fn per_core_usage_reports_every_logical_processor() {
+        let previous = [
+            CpuTimes {
+                idle: 100,
+                kernel: 200,
+                user: 100,
+            },
+            CpuTimes {
+                idle: 100,
+                kernel: 100,
+                user: 100,
+            },
+            CpuTimes {
+                idle: 0,
+                kernel: 0,
+                user: 0,
+            },
+        ];
+        let current = [
+            // 200 busy of 200 tracked ticks.
+            CpuTimes {
+                idle: 150,
+                kernel: 300,
+                user: 200,
+            },
+            // Counters did not advance: no measurement for this processor.
+            CpuTimes {
+                idle: 200,
+                kernel: 100,
+                user: 100,
+            },
+            // Every tick idle: the processor was doing nothing.
+            CpuTimes {
+                idle: 20,
+                kernel: 10,
+                user: 10,
+            },
+        ];
+
+        assert_eq!(cores_usage(&previous, &current), vec![75.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn per_core_usage_defaults_processors_without_a_baseline_to_zero() {
+        let current = [CpuTimes {
+            idle: 50,
+            kernel: 100,
+            user: 50,
+        }];
+
+        assert_eq!(cores_usage(&[], &current), vec![0.0]);
+        assert_eq!(cores_usage(&current, &[]), Vec::<f32>::new());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn processor_times_reports_the_machines_logical_processors() {
+        let times = platform::processor_times().expect("processor times");
+        assert!(!times.is_empty(), "no logical processors reported");
     }
 }

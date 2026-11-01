@@ -23,3 +23,31 @@ jobs:
       - name: Report daemon size
         shell: pwsh
         run: Get-Item target/release/peakcore.exe | Select-Object Name, Length
+
+  ui:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Type-check and build frontend
+        run: npm run build
+      - name: Frontend tests
+        run: npm test
+      - name: Check UI crate formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+      - name: Lint UI crate
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+      - name: Build UI release
+        run: cargo build --release --manifest-path src-tauri/Cargo.toml

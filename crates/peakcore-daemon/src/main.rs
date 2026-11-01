@@ -170,15 +170,16 @@ fn history(args: Vec<String>) {
                     println!("{},{},{}", point["ts_ms"], point["cpu"], point["mem_pct"]);
                 }
             } else {
-                println!("minute_ts_ms,cpu_avg,cpu_max,mem_avg,mem_max");
+                println!("minute_ts_ms,cpu_avg,cpu_max,mem_avg,mem_max,samples");
                 for point in points {
                     println!(
-                        "{},{},{},{},{}",
+                        "{},{},{},{},{},{}",
                         point["minute_ts_ms"],
                         point["cpu_avg"],
                         point["cpu_max"],
                         point["mem_avg"],
-                        point["mem_max"]
+                        point["mem_max"],
+                        point["samples"]
                     );
                 }
             }

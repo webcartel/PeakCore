@@ -4,6 +4,7 @@ export interface SysSnapshot {
   ts_ms: number
   cpu_total: number
   cpu_cores: number[]
+  config_revision: number
   mem: {
     total: number
     used: number
@@ -28,6 +29,14 @@ export interface ProcSample {
   io_write_bps: number
   threads: number
   handles: number
+  gpu_pct: number
+  gpu_memory: number
+}
+
+export interface GpuProcessMetrics {
+  pid: number
+  utilization_pct: number
+  memory: number
 }
 
 export interface HistoryPoint {
@@ -36,12 +45,26 @@ export interface HistoryPoint {
   mem_pct: number
 }
 
+export interface MinuteAggregate {
+  minute_ts_ms: number
+  cpu_avg: number
+  cpu_max: number
+  mem_avg: number
+  mem_max: number
+  samples: number
+}
+
 export interface NetworkInterfaceMetrics {
   id: number
   index: number
   name: string
   rx_bps: number
   tx_bps: number
+}
+
+export interface GpuEngineMetrics {
+  name: string
+  utilization_pct: number
 }
 
 export interface ResourceMetrics {
@@ -55,12 +78,18 @@ export interface ResourceMetrics {
   network_tx_bps: number
   network_available: boolean
   interfaces: NetworkInterfaceMetrics[]
+  gpu_available: boolean
+  gpu_utilization_pct: number
+  gpu_memory_used: number
+  gpu_engines: GpuEngineMetrics[]
+  gpu_processes: GpuProcessMetrics[]
 }
 
 export interface DashboardUpdate {
   ts_ms: number
   snapshot: SysSnapshot | null
   history: HistoryPoint[]
+  aggregates: MinuteAggregate[]
   processes: ProcSample[]
   resources: ResourceMetrics | null
   daemon_connected: boolean
@@ -71,6 +100,7 @@ export const useMetricsStore = defineStore('metrics', {
   state: () => ({
     snapshot: null as SysSnapshot | null,
     history: [] as HistoryPoint[],
+    aggregates: [] as MinuteAggregate[],
     processes: [] as ProcSample[],
     resources: null as ResourceMetrics | null,
     daemonConnected: false,
@@ -81,7 +111,18 @@ export const useMetricsStore = defineStore('metrics', {
     apply(update: DashboardUpdate) {
       this.snapshot = update.snapshot
       this.history = update.history
-      this.processes = update.processes
+      this.aggregates = update.aggregates ?? []
+      const gpu = new Map(
+        (update.resources?.gpu_processes ?? []).map((entry) => [entry.pid, entry]),
+      )
+      this.processes = update.processes.map((process) => {
+        const usage = gpu.get(process.pid)
+        return {
+          ...process,
+          gpu_pct: usage?.utilization_pct ?? 0,
+          gpu_memory: usage?.memory ?? 0,
+        }
+      })
       this.resources = update.resources
       this.daemonConnected = update.daemon_connected
       this.error = update.error

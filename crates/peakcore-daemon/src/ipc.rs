@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod windows_pipe {
     use super::*;
     use crate::state::SharedMetrics;
+    use peakcore_core::config::Config;
     use std::ffi::c_void;
     use std::ptr::null_mut;
 
@@ -175,10 +176,6 @@ mod windows_pipe {
         Ok(sid)
     }
 
-    pub fn pipe_name() -> io::Result<Vec<u16>> {
-        Ok(wide(&format!(r"\\.\pipe\peakcore-{}", current_user_sid()?)))
-    }
-
     fn pipe_security(sid: &str) -> io::Result<(SecurityAttributes, Handle)> {
         let sddl = wide(&format!("D:P(A;;GA;;;{sid})"));
         let mut descriptor = null_mut();
@@ -203,7 +200,13 @@ mod windows_pipe {
     }
 
     pub fn serve(shared: SharedMetrics, hwnd: usize) -> io::Result<()> {
-        let name = pipe_name()?;
+        serve_on(&peakcore_core::ipc_client::pipe_path()?, shared, hwnd)
+    }
+
+    /// Serves requests on an explicitly named pipe. Tests use a private name so
+    /// a running daemon cannot answer their requests.
+    pub fn serve_on(name: &str, shared: SharedMetrics, hwnd: usize) -> io::Result<()> {
+        let name = wide(name);
         let sid = current_user_sid()?;
         let (mut attributes, descriptor) = pipe_security(&sid)?;
         loop {
@@ -285,6 +288,9 @@ mod windows_pipe {
                 IpcReply::success(serde_json::to_value(&store.snapshot).unwrap_or_default())
             }
             "history" => history_reply(request.range.as_deref(), shared),
+            "config" => config_reply(),
+            "config_set" => config_set_reply(&request, &Config::path()),
+            "alerts" => alerts_reply(shared),
             "show_window" => {
                 // SAFETY: hwnd is the daemon's hidden tray window; WM_APP_IPC requests the dashboard.
                 if unsafe { PostMessageW(hwnd as Handle, WM_APP_IPC, 0, 0) } == 0 {
@@ -296,6 +302,55 @@ mod windows_pipe {
             "shutdown" => IpcReply::success(serde_json::json!({ "requested": true })),
             _ => IpcReply::failure(format!("unknown operation: {}", request.op)),
         }
+    }
+
+    pub(super) fn config_reply() -> IpcReply {
+        let path = Config::path();
+        match Config::load_or_create(&path) {
+            Ok(config) => IpcReply::success(serde_json::json!({
+                "config": config,
+                "path": path.display().to_string(),
+            })),
+            Err(error) => IpcReply::failure(format!("could not read config: {error}")),
+        }
+    }
+
+    pub(super) fn config_set_reply(request: &IpcRequest, path: &std::path::Path) -> IpcReply {
+        let Some(data) = request.data.clone() else {
+            return IpcReply::failure("config_set requires a config payload");
+        };
+        let config: Config = match serde_json::from_value(data) {
+            Ok(config) => config,
+            Err(error) => return IpcReply::failure(format!("invalid config: {error}")),
+        };
+        if let Err(error) = config.validate() {
+            return IpcReply::failure(error);
+        }
+        if let Err(error) = crate::tray::apply_config(&config) {
+            return IpcReply::failure(error);
+        }
+        match config.save(path) {
+            Ok(()) => IpcReply::success(serde_json::json!(config)),
+            Err(error) => IpcReply::failure(format!("could not save config: {error}")),
+        }
+    }
+
+    pub(super) fn alerts_reply(shared: &SharedMetrics) -> IpcReply {
+        let store = shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mem = &store.snapshot.mem;
+        let mem_pct = if mem.total == 0 {
+            0.0
+        } else {
+            (mem.used as f64 * 100.0 / mem.total as f64) as f32
+        };
+        let statuses = store.alerts.status(store.snapshot.cpu_total, mem_pct);
+        let history: Vec<_> = store.alerts.history().copied().collect();
+        IpcReply::success(serde_json::json!({
+            "statuses": statuses,
+            "history": history,
+        }))
     }
 
     fn history_reply(range: Option<&str>, shared: &SharedMetrics) -> IpcReply {
@@ -454,25 +509,163 @@ pub fn start_server(shared: crate::state::SharedMetrics, hwnd: usize) {
 #[cfg(all(test, windows))]
 mod integration_tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A private pipe per test instance, so the exchange never touches the
+    /// per-user pipe a running daemon may already own.
+    fn test_pipe_path() -> String {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        format!(
+            r"\\.\pipe\peakcore-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    #[test]
+    fn test_pipe_path_is_isolated_from_the_daemon_pipe() {
+        let daemon_pipe = peakcore_core::ipc_client::pipe_path().expect("daemon pipe path");
+        assert_ne!(test_pipe_path(), daemon_pipe);
+        assert_ne!(test_pipe_path(), test_pipe_path());
+    }
 
     #[test]
     fn named_pipe_client_and_server_exchange_requests() {
+        let pipe = test_pipe_path();
+        let server_pipe = pipe.clone();
         let shared = crate::state::new_shared_metrics();
-        let server = std::thread::spawn(move || windows_pipe::serve(shared, 0));
+        let server = std::thread::spawn(move || windows_pipe::serve_on(&server_pipe, shared, 0));
 
-        let ping = peakcore_core::ipc_client::request("ping", None).expect("ping response");
+        let ping =
+            peakcore_core::ipc_client::request_on(&pipe, "ping", None).expect("ping response");
         assert!(ping.ok);
 
-        let unknown = peakcore_core::ipc_client::request("unsupported_test_operation", None)
-            .expect("error response");
+        let unknown =
+            peakcore_core::ipc_client::request_on(&pipe, "unsupported_test_operation", None)
+                .expect("error response");
         assert!(!unknown.ok);
         assert!(unknown.error.unwrap().contains("unknown operation"));
-        let ping = peakcore_core::ipc_client::request("ping", None).expect("second ping");
+        let ping = peakcore_core::ipc_client::request_on(&pipe, "ping", None).expect("second ping");
         assert!(ping.ok);
 
         // A private test operation stops the listener after the response is written.
-        let stop = peakcore_core::ipc_client::request("__test_stop", None).expect("stop response");
+        let stop = peakcore_core::ipc_client::request_on(&pipe, "__test_stop", None)
+            .expect("stop response");
         assert!(!stop.ok);
         assert!(server.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn concurrent_clients_are_served_without_pipe_busy_errors() {
+        let pipe = test_pipe_path();
+        let server_pipe = pipe.clone();
+        let shared = crate::state::new_shared_metrics();
+        let server = std::thread::spawn(move || windows_pipe::serve_on(&server_pipe, shared, 0));
+
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let pipe = pipe.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..4 {
+                        let reply = peakcore_core::ipc_client::request_on(&pipe, "ping", None)
+                            .expect("concurrent ping");
+                        assert!(reply.ok);
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("concurrent worker");
+        }
+
+        let stop = peakcore_core::ipc_client::request_on(&pipe, "__test_stop", None)
+            .expect("stop response");
+        assert!(!stop.ok);
+        assert!(server.join().unwrap().is_ok());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod config_ipc_tests {
+    use super::windows_pipe::{alerts_reply, config_set_reply};
+    use peakcore_core::IpcRequest;
+    use peakcore_core::alerts::Alerts;
+    use peakcore_core::config::{AlertMetric, AlertRule, Config, Theme};
+
+    fn temp_config_path(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("peakcore-ipc-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("config.toml")
+    }
+
+    fn config_request(config: &Config) -> IpcRequest {
+        IpcRequest::new("config_set").with_data(serde_json::to_value(config).expect("config json"))
+    }
+
+    #[test]
+    fn config_set_saves_valid_settings_and_replies_with_them() {
+        let path = temp_config_path("save");
+        let mut config = Config::default();
+        config.ui.theme = Theme::Light;
+
+        let reply = config_set_reply(&config_request(&config), &path);
+        assert!(reply.ok, "unexpected error: {:?}", reply.error);
+        assert_eq!(Config::load(&path).expect("saved config"), config);
+
+        let saved: Config =
+            serde_json::from_value(reply.data.expect("reply data")).expect("config");
+        assert_eq!(saved, config);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn config_set_rejects_invalid_settings_without_writing_the_file() {
+        let path = temp_config_path("invalid");
+        let mut config = Config::default();
+        config.tray.warn_pct = 95;
+        config.tray.crit_pct = 90;
+
+        let reply = config_set_reply(&config_request(&config), &path);
+        assert!(!reply.ok);
+        assert!(reply.error.unwrap().contains("warn_pct"));
+        assert!(!path.exists(), "invalid settings must not reach the disk");
+    }
+
+    #[test]
+    fn config_set_requires_a_payload() {
+        let path = std::path::Path::new("unused-config.toml");
+        let reply = config_set_reply(&IpcRequest::new("config_set"), path);
+        assert!(!reply.ok);
+        assert!(reply.error.unwrap().contains("payload"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn alerts_reply_reports_rules_with_the_current_values() {
+        let shared = crate::state::new_shared_metrics();
+        {
+            let mut store = shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            store.snapshot.cpu_total = 91.0;
+            store.snapshot.mem.total = 100;
+            store.snapshot.mem.used = 50;
+            store.alerts = Alerts::new(vec![AlertRule {
+                metric: AlertMetric::Cpu,
+                threshold_pct: 90,
+                duration_s: 30,
+                cooldown_min: 10,
+            }]);
+        }
+
+        let reply = alerts_reply(&shared);
+        assert!(reply.ok, "unexpected error: {:?}", reply.error);
+        let data = reply.data.expect("reply data");
+        let statuses = data["statuses"].as_array().expect("statuses");
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0]["threshold_pct"], 90);
+        assert_eq!(statuses[0]["value_pct"], 91.0);
+        assert_eq!(statuses[0]["triggered"], false);
+        assert!(data["history"].as_array().expect("history").is_empty());
     }
 }

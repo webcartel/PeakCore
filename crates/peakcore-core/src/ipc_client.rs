@@ -21,6 +21,15 @@ mod windows {
     const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
     const READ_TIMEOUT: Duration = Duration::from_secs(2);
 
+    /// `WaitNamedPipeW` gives up when another client grabs the only free
+    /// instance first, and so does `CreateFileW`; both are retried until this
+    /// budget runs out.
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+    const CONNECT_SLICE: Duration = Duration::from_millis(75);
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    const ERROR_SEM_TIMEOUT: i32 = 121;
+    const ERROR_PIPE_BUSY: i32 = 231;
+
     #[repr(C)]
     struct SidAndAttributes {
         sid: *mut c_void,
@@ -94,7 +103,7 @@ mod windows {
         io::Error::from_raw_os_error(unsafe { GetLastError() } as i32)
     }
 
-    fn pipe_name() -> io::Result<Vec<u16>> {
+    pub(super) fn pipe_path() -> io::Result<String> {
         let mut token = null_mut();
         // SAFETY: requests the current process token for a read-only identity lookup.
         if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
@@ -149,51 +158,64 @@ mod windows {
         unsafe {
             LocalFree(string_sid.cast());
         }
-        Ok(wide(&format!(r"\\.\pipe\peakcore-{sid}")))
+        Ok(format!(r"\\.\pipe\peakcore-{sid}"))
     }
 
-    pub(super) fn request(op: &str, range: Option<&str>) -> io::Result<IpcReply> {
-        let name = pipe_name()?;
-        let deadline = Instant::now() + READ_TIMEOUT;
-        loop {
-            // SAFETY: pipe name is NUL-terminated; each wait is bounded to two seconds.
-            if unsafe { WaitNamedPipeW(name.as_ptr(), READ_TIMEOUT.as_millis() as u32) } != 0 {
-                break;
-            }
-            let error = last_error();
-            if !matches!(error.raw_os_error(), Some(2 | 121)) || Instant::now() >= deadline {
-                return Err(error);
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        // SAFETY: opens an existing local pipe for synchronous duplex I/O.
-        let handle = unsafe {
-            CreateFileW(
-                name.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
-                0,
-                null_mut(),
-                OPEN_EXISTING,
-                0,
-                null_mut(),
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(last_error());
-        }
+    pub(super) fn request_on(pipe: &str, request: &IpcRequest) -> io::Result<IpcReply> {
+        let name = wide(pipe);
+        let handle = connect(&name)?;
         let result = (|| {
-            let request = IpcRequest {
-                v: 1,
-                op: op.to_owned(),
-                range: range.map(str::to_owned),
-            };
-            write_frame(handle, &request)?;
+            write_frame(handle, request)?;
             read_reply(handle)
         })();
         unsafe {
             CloseHandle(handle);
         }
         result
+    }
+
+    fn connect(name: &[u16]) -> io::Result<Handle> {
+        let deadline = Instant::now() + CONNECT_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let slice = remaining.min(CONNECT_SLICE).max(Duration::from_millis(1));
+            // SAFETY: the pipe name is NUL-terminated; the wait is bounded by `slice`.
+            let available = unsafe { WaitNamedPipeW(name.as_ptr(), slice.as_millis() as u32) } != 0;
+            if available {
+                // SAFETY: opens an existing local pipe for synchronous duplex I/O.
+                let handle = unsafe {
+                    CreateFileW(
+                        name.as_ptr(),
+                        GENERIC_READ | GENERIC_WRITE,
+                        0,
+                        null_mut(),
+                        OPEN_EXISTING,
+                        0,
+                        null_mut(),
+                    )
+                };
+                if handle != INVALID_HANDLE_VALUE {
+                    return Ok(handle);
+                }
+            }
+            let error = last_error();
+            if !is_retryable(&error) {
+                return Err(error);
+            }
+            if Instant::now() >= deadline {
+                return Err(error);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Errors that simply mean "the daemon is between connections" or
+    /// "another client won the race for the only free instance".
+    fn is_retryable(error: &io::Error) -> bool {
+        matches!(
+            error.raw_os_error(),
+            Some(ERROR_FILE_NOT_FOUND | ERROR_SEM_TIMEOUT | ERROR_PIPE_BUSY)
+        )
     }
 
     fn write_frame<T: serde::Serialize>(handle: Handle, value: &T) -> io::Result<()> {
@@ -296,14 +318,59 @@ mod windows {
     }
 }
 
-pub fn request(op: &str, range: Option<&str>) -> io::Result<IpcReply> {
+/// Path of the per-user named pipe the daemon listens on.
+pub fn pipe_path() -> io::Result<String> {
     #[cfg(windows)]
     {
-        windows::request(op, range)
+        windows::pipe_path()
     }
     #[cfg(not(windows))]
     {
-        let _ = (op, range);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "PeakCore IPC is Windows-only",
+        ))
+    }
+}
+
+pub fn request(op: &str, range: Option<&str>) -> io::Result<IpcReply> {
+    let mut request = IpcRequest::new(op);
+    request.range = range.map(str::to_owned);
+    call(&request)
+}
+
+/// Sends an operation together with a JSON payload, used by `config_set`.
+pub fn request_data(op: &str, data: serde_json::Value) -> io::Result<IpcReply> {
+    call(&IpcRequest::new(op).with_data(data))
+}
+
+pub fn call(request: &IpcRequest) -> io::Result<IpcReply> {
+    send(None, request)
+}
+
+/// Sends `op` to an explicitly named pipe instead of the per-user daemon pipe.
+///
+/// Hidden from the docs: tests use it to talk to a private server instance
+/// without a live daemon intercepting their requests.
+#[doc(hidden)]
+pub fn request_on(pipe: &str, op: &str, range: Option<&str>) -> io::Result<IpcReply> {
+    let mut request = IpcRequest::new(op);
+    request.range = range.map(str::to_owned);
+    send(Some(pipe), &request)
+}
+
+fn send(pipe: Option<&str>, request: &IpcRequest) -> io::Result<IpcReply> {
+    let path = match pipe {
+        Some(pipe) => pipe.to_owned(),
+        None => pipe_path()?,
+    };
+    #[cfg(windows)]
+    {
+        windows::request_on(&path, request)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (&path, request);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "PeakCore IPC is Windows-only",

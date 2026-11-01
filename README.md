@@ -10,24 +10,36 @@ place; M4 process sampling is available and the first M5 dashboard shell is
 scaffolded. The overview now consumes daemon snapshots/history and live process
 samples; clearly marked demo values are shown until the first update arrives.
 The Processes page supports application grouping, search, sorting, virtualized
-rows, and a context menu for copying a PID or executable path. Disk read/write
+rows, executable icons and a context menu for copying a PID or executable path.
+Disk read/write
 rates and busy time plus per-interface network throughput are sampled only while
-the dashboard is open and shown on the Disk and Network pages. Network rows
+the dashboard is open and shown on the Disk and Network pages. The CPU page shows
+per-processor load as a heatmap fed by the daemon snapshot, and the GPU page
+reports engine utilisation and dedicated video memory through PDH. Network rows
 exclude NDIS filter layers and interfaces Windows marks disconnected at the IP
 layer. The Disk page reports
 unavailable PDH counters explicitly instead of displaying false zeroes.
-Alerts and settings pages remain placeholders. Executable icons,
+Settings are stored in `%APPDATA%\PeakCore\config.toml` and edited from the
+Settings page; the daemon applies interval, tray mode and thresholds live and
+writes the file back. The Alerts page manages threshold rules (metric,
+threshold, duration, cooldown) and lists the current state plus the events the
+daemon raised as Windows notifications in this run. The dashboard and the tray
+menu ship in Russian and English; the language lives in the same config file.
+Executable icons,
 manual DPI checks, and review in both themes remain.
 `peakcore-core`
 contains the system snapshot models, bounded history buffers, minute aggregates,
-and IPC client. On Windows,
-`peakcore-sys` samples total CPU with `GetSystemTimes` and memory with
+and IPC client. History lives only in memory: one hour of detailed points at any
+sampling interval (the buffer is sized for the fastest 500 ms rate) plus 24 hours
+of minute aggregates, both bounded by time rather than by sample count. On Windows,
+`peakcore-sys` samples total CPU with `GetSystemTimes` and per-processor load with
+`NtQuerySystemInformation`, memory with
 `GlobalMemoryStatusEx` / `GetPerformanceInfo`. Run `peakcore --print` to print
 CPU and RAM values once per second. Process rankings are available through
 `peakcore top --by cpu|mem -n 10`; the overview consumes live snapshots and
 process samples, and the Processes page shows live process and application
-rankings. The table virtualizes visible rows; executable icons are still pending. The
-default `peakcore` launch starts the
+rankings. The table virtualizes rows and shows executable icons from an in-memory
+cache. The default `peakcore` launch starts the
 tray process; its menu supports icon mode, refresh interval,
 per-user startup, and opening the configuration file. Use
 `./scripts/measure.ps1 -Tray` to measure the live tray process.
@@ -48,6 +60,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo build --workspace --release
 ```
+
+The dashboard ships Inter subsets (`ui/src/assets/fonts`, SIL OFL) and its
+frontend tests run with `npm test --prefix ui`. The last tray measurement on the
+reference machine: 7.96 MB working set and 0.078 % of one core at idle.
 
 On Windows, measure the idle daemon process with:
 

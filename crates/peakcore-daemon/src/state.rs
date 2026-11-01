@@ -1,3 +1,4 @@
+use peakcore_core::alerts::Alerts;
 use peakcore_core::{History, SysSnapshot};
 use std::sync::{Arc, Mutex};
 
@@ -5,6 +6,7 @@ use std::sync::{Arc, Mutex};
 pub struct MetricsStore {
     pub snapshot: SysSnapshot,
     pub history: History,
+    pub alerts: Alerts,
 }
 
 pub type SharedMetrics = Arc<Mutex<MetricsStore>>;

@@ -8,18 +8,24 @@ import DiskPage from './pages/DiskPage.vue'
 import NetworkPage from './pages/NetworkPage.vue'
 import CpuPage from './pages/CpuPage.vue'
 import MemoryPage from './pages/MemoryPage.vue'
+import GpuPage from './pages/GpuPage.vue'
+import SettingsPage from './pages/SettingsPage.vue'
+import AlertsPage from './pages/AlertsPage.vue'
 import PlaceholderPage from './pages/PlaceholderPage.vue'
 import './style.css'
 
 const router = createRouter({
   history: createWebHashHistory(),
   routes: [
-    { path: '/', component: OverviewPage, meta: { title: 'Обзор' } },
-    { path: '/processes', component: ProcessesPage, meta: { title: 'Процессы' } },
-    { path: '/disk', component: DiskPage, meta: { title: 'Диск' } },
-    { path: '/network', component: NetworkPage, meta: { title: 'Сеть' } },
-    { path: '/cpu', component: CpuPage, meta: { title: 'CPU' } },
-    { path: '/memory', component: MemoryPage, meta: { title: 'Память' } },
+    { path: '/', component: OverviewPage, meta: { titleKey: 'nav.overview' } },
+    { path: '/processes', component: ProcessesPage, meta: { titleKey: 'nav.processes' } },
+    { path: '/disk', component: DiskPage, meta: { titleKey: 'nav.disk' } },
+    { path: '/network', component: NetworkPage, meta: { titleKey: 'nav.network' } },
+    { path: '/cpu', component: CpuPage, meta: { titleKey: 'nav.cpu' } },
+    { path: '/memory', component: MemoryPage, meta: { titleKey: 'nav.memory' } },
+    { path: '/gpu', component: GpuPage, meta: { titleKey: 'nav.gpu' } },
+    { path: '/alerts', component: AlertsPage, meta: { titleKey: 'nav.alerts' } },
+    { path: '/settings', component: SettingsPage, meta: { titleKey: 'nav.settings' } },
     { path: '/:section(.*)', component: PlaceholderPage },
   ],
 })

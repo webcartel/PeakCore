@@ -1,16 +1,20 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { Activity, ArrowDown, ArrowUp, ChevronDown, Cpu, LayoutDashboard, Search, X } from '@lucide/vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useMetricsStore, type ProcSample } from '../stores/metrics'
+import Skeleton from '../components/Skeleton.vue'
+import { formatBytes, formatRate, formatTime, localeCode, t, tn } from '../i18n'
 
 type Mode = 'apps' | 'processes'
-type SortKey = 'cpu' | 'memory' | 'name' | 'read' | 'write'
+type SortKey = 'cpu' | 'memory' | 'name' | 'read' | 'write' | 'gpu'
 type AppGroup = {
   key: string
   name: string
   members: ProcSample[]
   cpu: number
+  gpuPct: number
+  gpuMemory: number
   privateBytes: number
   workingSet: number
   readBps: number
@@ -40,6 +44,8 @@ const topSpacer = computed(() => virtualStart.value * rowHeight)
 const bottomSpacer = computed(() => Math.max(0, (rows.value.length - virtualEnd.value) * rowHeight))
 const contextMenu = ref<{ x: number; y: number; process: ProcSample; path?: string; pathLoading: boolean } | null>(null)
 const copyStatus = ref('')
+const icons = reactive(new Map<number, string>())
+const pendingIcons = new Set<number>()
 
 function updateViewport() {
   if (!scrollElement.value) return
@@ -69,11 +75,11 @@ function onContextMenu(event: MouseEvent, process: ProcSample) {
 async function copyText(value: string) {
   try {
     await navigator.clipboard.writeText(value)
-    copyStatus.value = 'Скопировано'
+    copyStatus.value = t('processes.copied')
     contextMenu.value = null
     window.setTimeout(() => { copyStatus.value = '' }, 1400)
   } catch {
-    copyStatus.value = 'Буфер обмена недоступен'
+    copyStatus.value = t('processes.clipboardUnavailable')
     contextMenu.value = null
     window.setTimeout(() => { copyStatus.value = '' }, 1800)
   }
@@ -106,6 +112,8 @@ const appGroups = computed<AppGroup[]>(() => {
         name: process.name,
         members: [],
         cpu: 0,
+        gpuPct: 0,
+        gpuMemory: 0,
         privateBytes: 0,
         workingSet: 0,
         readBps: 0,
@@ -115,6 +123,8 @@ const appGroups = computed<AppGroup[]>(() => {
     }
     group.members.push(process)
     group.cpu += process.cpu
+    group.gpuPct += process.gpu_pct ?? 0
+    group.gpuMemory += process.gpu_memory ?? 0
     group.privateBytes += process.private_bytes
     group.workingSet += process.working_set
     group.readBps += process.io_read_bps
@@ -149,6 +159,22 @@ watch([search, mode], () => {
   scrollTop.value = 0
 })
 
+// Loads icons only for the rows currently on screen; the cache lives in memory.
+watch(visibleRows, (rows) => {
+  if (!('__TAURI_INTERNALS__' in window)) return
+  for (const row of rows) {
+    const pid = row.type === 'app' ? row.group.members[0].pid : row.process.pid
+    if (icons.has(pid) || pendingIcons.has(pid)) continue
+    pendingIcons.add(pid)
+    invoke<string | null>('get_process_icon', { pid })
+      .then((url) => {
+        if (url) icons.set(pid, url)
+      })
+      .catch(() => {})
+      .finally(() => pendingIcons.delete(pid))
+  }
+}, { immediate: true })
+
 function setSort(key: SortKey) {
   if (sortBy.value === key) {
     descending.value = !descending.value
@@ -159,14 +185,14 @@ function setSort(key: SortKey) {
 }
 
 function compareGroups(a: AppGroup, b: AppGroup) {
-  if (sortBy.value === 'name') return a.name.localeCompare(b.name, 'ru')
+  if (sortBy.value === 'name') return a.name.localeCompare(b.name, localeCode())
   const value = sortValue(a, sortBy.value) - sortValue(b, sortBy.value)
-  return (descending.value ? -value : value) || a.name.localeCompare(b.name, 'ru')
+  return (descending.value ? -value : value) || a.name.localeCompare(b.name, localeCode())
 }
 
 function compareProcesses(a: ProcSample, b: ProcSample) {
   if (sortBy.value === 'name') {
-    return a.name.localeCompare(b.name, 'ru') || a.pid - b.pid
+    return a.name.localeCompare(b.name, localeCode()) || a.pid - b.pid
   }
   const value = sortValue(a, sortBy.value) - sortValue(b, sortBy.value)
   return (descending.value ? -value : value) || a.pid - b.pid
@@ -175,6 +201,7 @@ function compareProcesses(a: ProcSample, b: ProcSample) {
 function sortValue(value: AppGroup | ProcSample, key: SortKey) {
   switch (key) {
     case 'cpu': return value.cpu
+    case 'gpu': return 'gpuPct' in value ? value.gpuPct : (value.gpu_pct ?? 0)
     case 'memory': return 'privateBytes' in value ? value.privateBytes : value.private_bytes
     case 'read': return 'readBps' in value ? value.readBps : value.io_read_bps
     case 'write': return 'writeBps' in value ? value.writeBps : value.io_write_bps
@@ -187,76 +214,66 @@ function toggleGroup(key: string) {
     ? expanded.value.filter((item) => item !== key)
     : [...expanded.value, key]
 }
-
-function formatBytes(value: number) {
-  if (value >= 1024 ** 3) return (value / 1024 ** 3).toFixed(1) + ' ГБ'
-  if (value >= 1024 ** 2) return Math.round(value / 1024 ** 2) + ' МБ'
-  if (value >= 1024) return Math.round(value / 1024) + ' КБ'
-  return value + ' Б'
-}
-
-function formatRate(value: number) {
-  if (value >= 1024 ** 2) return (value / 1024 ** 2).toFixed(1) + ' МБ/с'
-  if (value >= 1024) return Math.round(value / 1024) + ' КБ/с'
-  return value + ' Б/с'
-}
 </script>
 
 <template>
   <div class="processes-page">
     <header class="process-page-heading">
       <div>
-        <div class="eyebrow">PEAKCORE / МОНИТОРИНГ СИСТЕМЫ</div>
-        <h1>Процессы</h1>
-        <p>Потребление ресурсов запущенными приложениями</p>
+        <div class="eyebrow">{{ t('eyebrow.monitoring') }}</div>
+        <h1>{{ t('processes.title') }}</h1>
+        <p>{{ t('processes.subtitle') }}</p>
       </div>
-      <div class="process-count"><Activity :size="17" /><strong>{{ metrics.processes.length }}</strong><span>процессов</span></div>
+      <div class="process-count"><Activity :size="17" /><strong>{{ metrics.processes.length }}</strong><span>{{ tn('processes.count', metrics.processes.length) }}</span></div>
     </header>
 
     <section class="process-toolbar">
-      <div class="mode-switch" role="tablist" aria-label="Режим списка">
-        <button :class="{ selected: mode === 'apps' }" @click="mode = 'apps'"><LayoutDashboard :size="16" />Приложения</button>
-        <button :class="{ selected: mode === 'processes' }" @click="mode = 'processes'"><Activity :size="16" />Процессы</button>
+      <div class="mode-switch" role="tablist" :aria-label="t('processes.listMode')">
+        <button :class="{ selected: mode === 'apps' }" @click="mode = 'apps'"><LayoutDashboard :size="16" />{{ t('processes.apps') }}</button>
+        <button :class="{ selected: mode === 'processes' }" @click="mode = 'processes'"><Activity :size="16" />{{ t('processes.mode') }}</button>
       </div>
       <label class="process-search">
         <Search :size="17" />
-        <input v-model="search" placeholder="Поиск по имени, PID или пути" />
-        <button v-if="search" title="Очистить поиск" @click="search = ''"><X :size="15" /></button>
+        <input v-model="search" :placeholder="t('processes.search')" />
+        <button v-if="search" :title="t('processes.clearSearch')" @click="search = ''"><X :size="15" /></button>
       </label>
     </section>
 
     <section class="process-table-card">
       <div class="table-summary">
-        <span>{{ mode === 'apps' ? appGroups.length + ' приложений' : filteredProcesses.length + ' процессов' }}</span>
-        <span v-if="metrics.lastUpdated" class="sample-status"><i></i> Обновлено {{ new Date(metrics.lastUpdated).toLocaleTimeString('ru-RU') }}</span>
-        <span v-else class="sample-status waiting"><i></i> Ожидание данных</span>
+        <span>{{ mode === 'apps' ? tn('processes.appsCount', appGroups.length) : tn('processes.processesCount', filteredProcesses.length) }}</span>
+        <span v-if="metrics.lastUpdated" class="sample-status"><i></i> {{ t('common.updated', { time: formatTime(metrics.lastUpdated) }) }}</span>
+        <span v-else class="sample-status waiting"><i></i> {{ t('common.waiting') }}</span>
       </div>
       <div ref="scrollElement" class="process-table-scroll" @scroll="updateViewport">
         <table class="process-table">
           <thead>
             <tr>
               <th class="process-column">
-                <button @click="setSort('name')">ИМЯ <component :is="sortBy === 'name' ? (descending ? ArrowDown : ArrowUp) : ChevronDown" :size="13" /></button>
+                <button @click="setSort('name')">{{ t('processes.col.name') }} <component :is="sortBy === 'name' ? (descending ? ArrowDown : ArrowUp) : ChevronDown" :size="13" /></button>
               </th>
               <th><button @click="setSort('cpu')">CPU <component :is="sortBy === 'cpu' ? (descending ? ArrowDown : ArrowUp) : ChevronDown" :size="13" /></button></th>
-              <th><button @click="setSort('memory')">PRIVATE <component :is="sortBy === 'memory' ? (descending ? ArrowDown : ArrowUp) : ChevronDown" :size="13" /></button></th>
-              <th><span>WORKING SET</span></th>
-              <th><button @click="setSort('read')">ЧТЕНИЕ <component :is="sortBy === 'read' ? (descending ? ArrowDown : ArrowUp) : ChevronDown" :size="13" /></button></th>
-              <th><button @click="setSort('write')">ЗАПИСЬ <component :is="sortBy === 'write' ? (descending ? ArrowDown : ArrowUp) : ChevronDown" :size="13" /></button></th>
+              <th><button @click="setSort('gpu')">{{ t('processes.col.gpu') }} <component :is="sortBy === 'gpu' ? (descending ? ArrowDown : ArrowUp) : ChevronDown" :size="13" /></button></th>
+              <th><button @click="setSort('memory')">{{ t('processes.col.private') }} <component :is="sortBy === 'memory' ? (descending ? ArrowDown : ArrowUp) : ChevronDown" :size="13" /></button></th>
+              <th><span>{{ t('processes.col.workingSet') }}</span></th>
+              <th><button @click="setSort('read')">{{ t('processes.col.read') }} <component :is="sortBy === 'read' ? (descending ? ArrowDown : ArrowUp) : ChevronDown" :size="13" /></button></th>
+              <th><button @click="setSort('write')">{{ t('processes.col.write') }} <component :is="sortBy === 'write' ? (descending ? ArrowDown : ArrowUp) : ChevronDown" :size="13" /></button></th>
             </tr>
           </thead>
           <tbody v-if="metrics.processes.length">
-            <tr v-if="topSpacer" class="virtual-spacer"><td colspan="6" :style="{ height: topSpacer + 'px' }"></td></tr>
+            <tr v-if="topSpacer" class="virtual-spacer"><td colspan="7" :style="{ height: topSpacer + 'px' }"></td></tr>
             <template v-for="row in visibleRows" :key="row.key">
               <tr v-if="row.type === 'app'" class="app-row" @click="toggleGroup(row.group.key)" @contextmenu="onContextMenu($event, row.group.members[0])">
                 <td class="process-column">
                   <div class="process-cell">
-                    <button class="expand-button" :aria-label="expanded.includes(row.group.key) ? 'Свернуть группу' : 'Раскрыть группу'"><ChevronDown :size="15" :class="{ rotated: expanded.includes(row.group.key) }" /></button>
-                    <span class="process-avatar">{{ row.group.name.slice(0, 1).toUpperCase() }}</span>
-                    <span class="process-cell-copy"><strong>{{ row.group.name }}</strong><small>{{ row.group.members.length }} экземпляр(а) · PID {{ row.group.members.map((process) => process.pid).join(', ') }}</small></span>
+                    <button class="expand-button" :aria-label="expanded.includes(row.group.key) ? t('processes.collapse') : t('processes.expand')"><ChevronDown :size="15" :class="{ rotated: expanded.includes(row.group.key) }" /></button>
+                    <img v-if="icons.get(row.group.members[0].pid)" class="process-icon" :src="icons.get(row.group.members[0].pid)" alt="" />
+                    <span v-else class="process-avatar">{{ row.group.name.slice(0, 1).toUpperCase() }}</span>
+                    <span class="process-cell-copy"><strong>{{ row.group.name }}</strong><small>{{ tn('processes.instances', row.group.members.length, { pids: row.group.members.map((process) => process.pid).join(', ') }) }}</small></span>
                   </div>
                 </td>
                 <td><ResourceBar :value="row.group.cpu" :label="row.group.cpu.toFixed(1) + '%'" kind="cpu" /></td>
+                <td class="numeric-cell gpu-cell" :class="{ 'muted-cell': !row.group.gpuPct }">{{ row.group.gpuPct ? row.group.gpuPct.toFixed(1) + '%' : '—' }}<small v-if="row.group.gpuMemory">{{ formatBytes(row.group.gpuMemory) }}</small></td>
                 <td class="numeric-cell">{{ formatBytes(row.group.privateBytes) }}</td>
                 <td class="numeric-cell muted-cell">{{ formatBytes(row.group.workingSet) }}</td>
                 <td class="numeric-cell muted-cell">{{ formatRate(row.group.readBps) }}</td>
@@ -266,11 +283,13 @@ function formatRate(value: number) {
                 <td class="process-column">
                   <div class="process-cell child-cell">
                     <span class="child-branch"></span>
-                    <span class="process-avatar child-avatar">{{ row.process.name.slice(0, 1).toUpperCase() }}</span>
-                    <span class="process-cell-copy"><strong>{{ row.process.name }}</strong><small>PID {{ row.process.pid }} · {{ row.process.threads }} потоков · {{ row.process.handles }} handles</small></span>
+                    <img v-if="icons.get(row.process.pid)" class="process-icon" :src="icons.get(row.process.pid)" alt="" />
+                    <span v-else class="process-avatar child-avatar">{{ row.process.name.slice(0, 1).toUpperCase() }}</span>
+                    <span class="process-cell-copy"><strong>{{ row.process.name }}</strong><small>{{ t('processes.threadsHandles', { threads: row.process.threads, handles: row.process.handles }) }} · PID {{ row.process.pid }}</small></span>
                   </div>
                 </td>
                 <td><ResourceBar :value="row.process.cpu" :label="row.process.cpu.toFixed(1) + '%'" kind="cpu" /></td>
+                <td class="numeric-cell gpu-cell" :class="{ 'muted-cell': !row.process.gpu_pct }">{{ row.process.gpu_pct ? row.process.gpu_pct.toFixed(1) + '%' : '—' }}<small v-if="row.process.gpu_memory">{{ formatBytes(row.process.gpu_memory) }}</small></td>
                 <td class="numeric-cell">{{ formatBytes(row.process.private_bytes) }}</td>
                 <td class="numeric-cell muted-cell">{{ formatBytes(row.process.working_set) }}</td>
                 <td class="numeric-cell muted-cell">{{ formatRate(row.process.io_read_bps) }}</td>
@@ -279,36 +298,46 @@ function formatRate(value: number) {
               <tr v-else class="single-process-row" @contextmenu="onContextMenu($event, row.process)">
                 <td class="process-column">
                   <div class="process-cell">
-                    <span class="process-avatar">{{ row.process.name.slice(0, 1).toUpperCase() }}</span>
-                    <span class="process-cell-copy"><strong>{{ row.process.name }}</strong><small>PID {{ row.process.pid }} · {{ row.process.threads }} потоков · {{ row.process.handles }} handles</small></span>
+                    <img v-if="icons.get(row.process.pid)" class="process-icon" :src="icons.get(row.process.pid)" alt="" />
+                    <span v-else class="process-avatar">{{ row.process.name.slice(0, 1).toUpperCase() }}</span>
+                    <span class="process-cell-copy"><strong>{{ row.process.name }}</strong><small>{{ t('processes.threadsHandles', { threads: row.process.threads, handles: row.process.handles }) }} · PID {{ row.process.pid }}</small></span>
                   </div>
                 </td>
                 <td><ResourceBar :value="row.process.cpu" :label="row.process.cpu.toFixed(1) + '%'" kind="cpu" /></td>
+                <td class="numeric-cell gpu-cell" :class="{ 'muted-cell': !row.process.gpu_pct }">{{ row.process.gpu_pct ? row.process.gpu_pct.toFixed(1) + '%' : '—' }}<small v-if="row.process.gpu_memory">{{ formatBytes(row.process.gpu_memory) }}</small></td>
                 <td class="numeric-cell">{{ formatBytes(row.process.private_bytes) }}</td>
                 <td class="numeric-cell muted-cell">{{ formatBytes(row.process.working_set) }}</td>
                 <td class="numeric-cell muted-cell">{{ formatRate(row.process.io_read_bps) }}</td>
                 <td class="numeric-cell muted-cell">{{ formatRate(row.process.io_write_bps) }}</td>
               </tr>
             </template>
-            <tr v-if="bottomSpacer" class="virtual-spacer"><td colspan="6" :style="{ height: bottomSpacer + 'px' }"></td></tr>
+            <tr v-if="bottomSpacer" class="virtual-spacer"><td colspan="7" :style="{ height: bottomSpacer + 'px' }"></td></tr>
           </tbody>
         </table>
-        <div v-if="!metrics.processes.length" class="empty-processes">
-          <span class="empty-icon"><Cpu :size="24" /></span>
-          <strong>{{ search ? 'Ничего не найдено' : 'Нет данных о процессах' }}</strong>
-          <p>{{ search ? 'Измените поисковый запрос.' : 'Выборка появится, когда окно будет открыто.' }}</p>
+        <div v-if="!metrics.processes.length && !metrics.lastUpdated" class="process-skeleton-list">
+          <div v-for="n in 7" :key="n" class="process-skeleton-row">
+            <Skeleton width="35px" height="35px" radius="10px" />
+            <Skeleton :width="`${160 + (n % 4) * 40}px`" />
+            <span class="process-skeleton-gap"></span>
+            <Skeleton width="96px" />
+          </div>
         </div>
-        <div v-else-if="!rows.length" class="empty-processes compact-empty"><strong>По запросу ничего не найдено</strong></div>
+        <div v-else-if="!metrics.processes.length" class="empty-processes">
+          <span class="empty-icon"><Cpu :size="24" /></span>
+          <strong>{{ search ? t('processes.emptySearchTitle') : t('processes.emptyTitle') }}</strong>
+          <p>{{ search ? t('processes.emptySearchText') : t('processes.emptyText') }}</p>
+        </div>
+        <div v-else-if="!rows.length" class="empty-processes compact-empty"><strong>{{ t('processes.emptyFilter') }}</strong></div>
       </div>
     </section>
     <div v-if="contextMenu" class="process-context-menu" :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }" @pointerdown.stop>
       <strong>{{ contextMenu.process.name }}</strong>
-      <button @click="copyText(String(contextMenu.process.pid))">Копировать PID {{ contextMenu.process.pid }}</button>
-      <button v-if="contextMenu.path" @click="copyText(contextMenu.path)">Копировать путь к файлу</button>
-      <span v-else class="context-unavailable">{{ contextMenu.pathLoading ? 'Получаем путь…' : 'Путь недоступен' }}</span>
+      <button @click="copyText(String(contextMenu.process.pid))">{{ t('processes.copyPid', { pid: contextMenu.process.pid }) }}</button>
+      <button v-if="contextMenu.path" @click="copyText(contextMenu.path)">{{ t('processes.copyPath') }}</button>
+      <span v-else class="context-unavailable">{{ contextMenu.pathLoading ? t('processes.pathLoading') : t('processes.pathUnavailable') }}</span>
     </div>
     <div v-if="copyStatus" class="copy-toast">{{ copyStatus }}</div>
-    <footer class="page-footer"><span>Память: Private Bytes · Working Set показан отдельно</span><span>Поиск учитывает имя, PID и путь к файлу</span></footer>
+    <footer class="page-footer"><span>{{ t('processes.footerLeft') }}</span><span>{{ t('processes.footerRight') }}</span></footer>
   </div>
 </template>
 
